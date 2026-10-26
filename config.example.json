@@ -1,0 +1,13 @@
+{
+  "TenantId": "YOUR_TENANT_ID",
+  "ApplicationId": "YOUR_APPLICATION_CLIENT_ID",
+  "ClientSecret": "PASTE_ROTATED_CLIENT_SECRET_HERE",
+  "GraphBaseUrl": "https://graph.microsoft.com/v1.0",
+  "GraphBetaBaseUrl": "https://graph.microsoft.com/beta",
+  "ListenPrefix": "http://127.0.0.1:8088/",
+  "AllowedOrigin": "",
+  "EnableRealDelete": false,
+  "RequestTimeoutSeconds": 60,
+  "ProxyUrl": "",
+  "UseDefaultProxyCredentials": false
+}

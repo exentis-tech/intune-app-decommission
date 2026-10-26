@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: Unit tests & JS syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm test
+      - name: Check JavaScript syntax
+        run: for f in js/*.js tests/*.js; do node --check "$f"; done
+
+  server:
+    name: Server tests (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: PowerShell 7 / Linux
+            os: ubuntu-latest
+            pwsh: pwsh
+          - name: PowerShell 7 / Windows
+            os: windows-latest
+            pwsh: pwsh
+          - name: Windows PowerShell 5.1
+            os: windows-latest
+            pwsh: powershell
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Parse server.ps1
+        shell: pwsh
+        run: |
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile("$PWD/server.ps1", [ref]$null, [ref]$errors)
+          if ($errors) { $errors | ForEach-Object { Write-Error $_.ToString() }; exit 1 }
+      - name: End-to-end tests against a fake Graph
+        run: npm run test:server
+        env:
+          PWSH: ${{ matrix.pwsh }}
+
+  hygiene:
+    name: No secrets committed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: config.json and logs must not be tracked
+        run: |
+          if git ls-files | grep -E '(^|/)config\.json$|^logs/'; then
+            echo "::error::config.json or logs/ is committed. Remove it and rotate the secret."; exit 1
+          fi
+      - name: config.example.json must hold placeholders only
+        run: |
+          grep -q '"ClientSecret": "PASTE_' config.example.json || { echo "::error::config.example.json contains a real-looking secret"; exit 1; }

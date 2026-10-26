@@ -1,0 +1,15 @@
+{
+  "name": "intune-app-decommission",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Retire old Intune app packages, their assignments and their Entra ID groups in bulk, with a dry run.",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test tests/intune.test.js",
+    "test:server": "node --test --test-concurrency=1 tests/server.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Intune App Decommission</title>
+  <meta name="description" content="Find, retire and clean up old Intune app packages, their assignments and their Entra ID groups in bulk, with a dry-run mode.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230f766e'/%3E%3Cpath d='M9 11h14M12 11v12h8V11M14 8h4' stroke='white' stroke-width='2.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="css/app.css">
+</head>
+<body data-mode="dry">
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">
+        <svg viewBox="0 0 32 32"><rect width="32" height="32" rx="7"/><path d="M9 11h14M12 11v12h8V11M14 8h4"/></svg>
+      </span>
+      <div>
+        <strong>Intune App Decommission</strong>
+        <span class="muted">Retire old packages, assignments and groups</span>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <div class="mode" id="modeSwitch" role="radiogroup" aria-label="Execution mode" hidden>
+        <button type="button" role="radio" data-mode="dry" aria-checked="true">Dry run</button>
+        <button type="button" role="radio" data-mode="live" aria-checked="false">Live</button>
+      </div>
+      <div class="who" id="who"></div>
+    </div>
+  </header>
+
+  <div class="live-banner" id="liveBanner" hidden>
+    <strong>LIVE MODE</strong> — actions write to <span id="liveTenant"></span>. Switch back to Dry run to preview safely.
+  </div>
+  <div class="demo-banner" id="demoBanner" hidden>
+    Demo tenant — sample data held in this tab only. Nothing reaches Microsoft Graph.
+  </div>
+
+  <main>
+    <!-- Connect -->
+    <section class="connect" id="connect" hidden>
+      <div class="connect-card">
+        <h1>Connect to your tenant</h1>
+        <p class="muted">Sign in with an Entra app registration (Single-page application platform). Your tokens stay in this browser tab; there is no server.</p>
+        <form id="connectForm" autocomplete="off">
+          <label>Application (client) ID
+            <input name="clientId" required pattern="[0-9a-fA-F\-]{36}" placeholder="00000000-0000-0000-0000-000000000000">
+          </label>
+          <label>Tenant ID or domain
+            <input name="tenantId" placeholder="contoso.onmicrosoft.com or organizations">
+          </label>
+          <fieldset>
+            <legend>Permissions to request</legend>
+            <label class="check"><input type="checkbox" name="allowGroupDelete"> Allow deleting groups <code>Group.ReadWrite.All</code></label>
+            <label class="check"><input type="checkbox" name="policyScan"> Check group usage in policies <code>DeviceManagementConfiguration.Read.All</code></label>
+            <p class="hint">Always requested: <code>DeviceManagementApps.ReadWrite.All</code>. Without group deletion, <code>Group.Read.All</code> is used instead.</p>
+          </fieldset>
+          <div class="redirect">Redirect URI to register: <code id="redirectUri"></code></div>
+          <div class="row">
+            <button class="btn primary" type="submit">Sign in with Microsoft</button>
+            <button class="btn ghost" type="button" id="demoBtn">Try the demo tenant</button>
+          </div>
+          <p class="error" id="connectError" hidden></p>
+        </form>
+      </div>
+    </section>
+
+    <!-- Workspace -->
+    <section id="workspace" hidden>
+      <nav class="tabs" role="tablist">
+        <button role="tab" data-tab="apps" aria-selected="true">1 · Find apps</button>
+        <button role="tab" data-tab="groups" aria-selected="false">2 · Groups ledger <span class="count" id="ledgerCount">0</span></button>
+        <button role="tab" data-tab="log" aria-selected="false">Activity log <span class="count" id="logCount">0</span></button>
+      </nav>
+
+      <!-- Apps -->
+      <div class="tab" id="tab-apps">
+        <form class="panel search" id="searchForm">
+          <div class="search-main">
+            <label class="grow">App names to find <span class="muted">— one per line, lines starting with # are ignored</span>
+              <textarea name="patterns" rows="5" spellcheck="false" placeholder="7-Zip 19&#10;Notepad++ 7.*&#10;(Retired)&#10;Java Runtime 8u202"></textarea>
+            </label>
+            <div class="search-side">
+              <label>Match mode
+                <select name="mode" id="matchMode"></select>
+              </label>
+              <label>Exclude names <span class="muted">— ; separated, text or wildcard</span>
+                <input name="exclude" placeholder="e.g. 23.01; Enterprise">
+              </label>
+              <label class="check"><input type="checkbox" name="assignedOnly"> Only apps with assignments</label>
+              <div class="row">
+                <button class="btn primary" type="submit">Search</button>
+                <button class="btn ghost" type="button" id="refreshCatalog" title="Reload the app list from Intune">Reload catalog</button>
+              </div>
+            </div>
+          </div>
+          <p class="hint" id="catalogInfo"></p>
+        </form>
+        <div class="panel result-filters" id="resultFilters" hidden>
+          <label>Filter results by name
+            <input id="rName" type="search" placeholder="e.g. _AE1 or *User_A?1">
+          </label>
+          <label>Version
+            <div class="inline">
+              <select id="rVerOp"></select>
+              <input id="rVer" placeholder="e.g. 8.0 or 7.*">
+            </div>
+          </label>
+          <label>Assignments
+            <select id="rAssigned">
+              <option value="">All apps</option>
+              <option value="yes">With assignments</option>
+              <option value="no">Without assignments</option>
+            </select>
+          </label>
+          <div class="filter-actions">
+            <button type="button" class="btn ghost" id="rReset">Reset filters</button>
+          </div>
+          <p class="hint" id="rInfo"></p>
+        </div>
+        <div id="appResults"></div>
+      </div>
+
+      <!-- Groups -->
+      <div class="tab" id="tab-groups" hidden>
+        <div class="panel">
+          <p class="lede">Every group that was assigned to an app you cleaned up is recorded here, with the app it came from. Decide group by group, or filter by name and act in bulk. Live entries are kept in this browser and can be exported.</p>
+          <div class="filters">
+            <label>Name filter
+              <div class="inline">
+                <select id="gMode"></select>
+                <input id="gPattern" placeholder="e.g. SG-APP-*">
+              </div>
+            </label>
+            <label>Status
+              <select id="gStatus">
+                <option value="open">Pending decision</option>
+                <option value="all">All</option>
+                <option value="deleted">Deleted</option>
+                <option value="kept">Kept</option>
+                <option value="failed">Failed</option>
+              </select>
+            </label>
+            <label>From run
+              <select id="gRun"><option value="">All runs</option></select>
+            </label>
+            <div class="toggles">
+              <label class="check"><input type="checkbox" id="gHideInUse"> Hide groups still in use</label>
+              <label class="check"><input type="checkbox" id="gHideSynced" checked> Hide AD-synced groups</label>
+              <label class="check"><input type="checkbox" id="gShowDry" checked> Show dry-run entries</label>
+            </div>
+          </div>
+          <div class="toolbar">
+            <button class="btn" id="gDetails">Load group details</button>
+            <button class="btn" id="gScan">Check usage across tenant</button>
+            <span class="sep"></span>
+            <button class="btn" id="gSelectAll">Select all shown</button>
+            <button class="btn ghost" id="gSelectNone">Clear selection</button>
+            <span class="sep"></span>
+            <button class="btn danger" id="gDelete">Delete selected groups…</button>
+            <button class="btn" id="gKeep">Keep selected</button>
+            <button class="btn ghost" id="gForget">Remove from ledger</button>
+            <span class="grow"></span>
+            <button class="btn ghost" id="gExportCsv">Export CSV</button>
+            <button class="btn ghost" id="gExportJson">Export JSON</button>
+            <label class="btn ghost file">Import JSON<input type="file" id="gImport" accept="application/json,.json"></label>
+          </div>
+          <p class="hint" id="scanInfo"></p>
+        </div>
+        <div id="groupResults"></div>
+      </div>
+
+      <!-- Log -->
+      <div class="tab" id="tab-log" hidden>
+        <div class="panel toolbar">
+          <span class="lede">Every write, real or simulated, in this session.</span>
+          <span class="grow"></span>
+          <button class="btn ghost" id="logExport">Export CSV</button>
+          <button class="btn ghost" id="logClear">Clear</button>
+        </div>
+        <div id="logResults"></div>
+      </div>
+    </section>
+  </main>
+
+  <div class="actionbar" id="actionbar" hidden></div>
+
+  <dialog id="modal" aria-labelledby="modalTitle">
+    <form method="dialog" class="modal" id="modalForm"></form>
+  </dialog>
+
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+
+  <footer class="foot">
+    Open source · MIT · Uses Microsoft Graph beta endpoints for Intune. Always start in Dry run.
+  </footer>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
