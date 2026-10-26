@@ -142,9 +142,10 @@ When you're done, set `EnableRealDelete` back to `false`.
 | UI shows *The local server was restarted. Reload the page.* | The session token changed. Reload the browser tab. |
 | `RealDeleteDisabled` | Expected while `EnableRealDelete` is `false`. |
 | `NotAllowed: Deleting … is not allowed by this tool` | The server only performs three kinds of delete (app, app assignment, group). |
+| `OnlyRemovalAllowed` | A relationship update would have added or changed a link; the server only allows removing links. |
 | Group deletion button is disabled | The token has `Group.Read.All`, not `Group.ReadWrite.All`. |
 | *Usage check: Remediations (403 no permission)* | `DeviceManagementConfiguration.Read.All` missing, or Remediations not licensed in the tenant. |
-| Delete app fails with *dependency or supersedence* | Remove the relationship in the Intune portal first. The tool flags these apps. |
+| Delete app fails with *dependency or supersedence* | Use *Remove the links first, then delete* in the Delete dialog (the default). If a kept app *depends* on the app, also tick *Also remove dependencies from kept apps* — or replace that dependency in Intune first. |
 | Group delete fails on an AD group | AD-synced groups are managed on-premises; delete them in Active Directory. |
 | Slow on very large tenants | Graph throttling is handled automatically (`Retry-After`); scans of thousands of apps take a few minutes. |
 | Corporate proxy | Set `ProxyUrl`, and `UseDefaultProxyCredentials: true` for an authenticating proxy. |

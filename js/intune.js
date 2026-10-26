@@ -66,6 +66,7 @@ export function appFlags(app) {
   const dep = app.dependentAppCount || 0;
   const sup = (app.supersedingAppCount || 0) + (app.supersededAppCount || 0);
   if (dep) flags.push({ key: 'dependency', level: 'warn', text: `${dep} dependent app${dep > 1 ? 's' : ''}` });
+  if (app.dependsOnCount) flags.push({ key: 'dependsOn', level: 'info', text: `Depends on ${app.dependsOnCount} app${app.dependsOnCount > 1 ? 's' : ''}` });
   if (sup) flags.push({ key: 'supersedence', level: 'warn', text: 'Supersedence relationship' });
   if (SYNCED_TYPES.has(appType(app))) flags.push({ key: 'synced', level: 'info', text: 'Synced from store' });
   return flags;
@@ -73,6 +74,113 @@ export function appFlags(app) {
 
 export function blocksDelete(app) {
   return appFlags(app).some(f => f.key === 'dependency' || f.key === 'supersedence');
+}
+
+// ---------- relationships (supersedence & dependency) ----------
+//
+// GET  /mobileApps/{id}/relationships returns rows from this app's point of view:
+//   targetType 'child'  = this app supersedes / depends on targetId   (owned by this app)
+//   targetType 'parent' = targetId supersedes / depends on this app   (owned by targetId)
+// POST /mobileApps/{id}/updateRelationships replaces the *child* rows an app owns.
+// Intune refuses to delete an app while any row exists, so a row must be removed from
+// whichever app owns it.
+
+export const relKind = row => (/Dependency$/.test(row['@odata.type'] || '') ? 'dependency' : 'supersedence');
+
+export async function loadRelationships(graph, ids, onProgress) {
+  const res = await graph.batch(ids.map(id => ({ id, url: `/deviceAppManagement/mobileApps/${id}/relationships` })), { onProgress });
+  const out = new Map();
+  for (const id of ids) {
+    const r = res.get(id);
+    if (r && r.status === 200) out.set(id, (r.body && r.body.value) || []);
+    else if (r && r.status === 404) out.set(id, []);
+    else out.set(id, { error: r ? `${r.status} ${(r.body && r.body.error && r.body.error.message) || ''}`.trim() : 'No response' });
+  }
+  return out;
+}
+
+/** Set the relationship counters an app list shows from its relationship rows. */
+export function applyRelationshipCounts(app, rows) {
+  if (!Array.isArray(rows)) return;
+  app.supersedingAppCount = rows.filter(r => r.targetType === 'child' && relKind(r) === 'supersedence').length;
+  app.supersededAppCount = rows.filter(r => r.targetType === 'parent' && relKind(r) === 'supersedence').length;
+  app.dependentAppCount = rows.filter(r => r.targetType === 'parent' && relKind(r) === 'dependency').length;
+  app.dependsOnCount = rows.filter(r => r.targetType === 'child' && relKind(r) === 'dependency').length;
+}
+
+/** Body entry for updateRelationships, rebuilt from a child row. */
+export function relationshipBody(row) {
+  return relKind(row) === 'dependency'
+    ? { '@odata.type': '#microsoft.graph.mobileAppDependency', targetId: row.targetId, dependencyType: row.dependencyType || 'autoInstall' }
+    : { '@odata.type': '#microsoft.graph.mobileAppSupersedence', targetId: row.targetId, supersedenceType: row.supersedenceType || 'update' };
+}
+
+/**
+ * Work out what must be unlinked before `deleteApps` can be deleted.
+ * @param {object[]} deleteApps
+ * @param {Map<string, object[]|{error:string}>} rels  relationships of the apps to delete
+ * @param {(ids:string[]) => Promise<Map>} loadMore   loads relationships of other (kept) owner apps
+ * @returns plan: { links, updates, errors }
+ *   links:   every relationship touching a deleted app, with owner/other and a category
+ *   updates: one entry per owner app to rewrite: { ownerId, ownerName, keep: rows, remove: rows, kept: bool }
+ */
+export async function planUnlink(deleteApps, rels, loadMore) {
+  const del = new Map(deleteApps.map(a => [a.id, a]));
+  const errors = [];
+  const links = [];
+  const seen = new Set();
+  const keptOwners = new Set();
+  for (const app of deleteApps) {
+    const rows = rels.get(app.id);
+    if (!Array.isArray(rows)) { errors.push({ app, message: rows ? rows.error : 'Relationships not loaded' }); continue; }
+    for (const row of rows) {
+      const owner = row.targetType === 'child' ? app.id : row.targetId;
+      const other = row.targetType === 'child' ? row.targetId : app.id;
+      const key = `${owner}>${other}>${relKind(row)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const ownerName = row.targetType === 'child' ? app.displayName : row.targetDisplayName;
+      const otherName = row.targetType === 'child' ? row.targetDisplayName : app.displayName;
+      const ownerVersion = row.targetType === 'child' ? appVersion(app).value : row.targetDisplayVersion || '';
+      const otherVersion = row.targetType === 'child' ? row.targetDisplayVersion || '' : appVersion(app).value;
+      const ownerKept = !del.has(owner);
+      const otherKept = !del.has(other);
+      // Categories:
+      //  internal      - both apps are being deleted
+      //  supersededBy  - a kept app supersedes a deleted one (safe: the kept app just stops pointing at it)
+      //  dependedOnBy  - a kept app depends on a deleted one (risky: the kept app loses a prerequisite)
+      //  outbound      - a deleted app supersedes / depends on a kept app (safe: the row disappears with it)
+      const category = !ownerKept && !otherKept ? 'internal'
+        : ownerKept ? (relKind(row) === 'dependency' ? 'dependedOnBy' : 'supersededBy')
+        : 'outbound';
+      if (ownerKept) keptOwners.add(owner);
+      links.push({ owner, ownerName, ownerVersion, other, otherName, otherVersion, kind: relKind(row), category, ownerKept,
+        detail: row.dependencyType || row.supersedenceType || '' });
+    }
+  }
+
+  // Kept owners: read their full relationship list so the rows we keep are re-sent unchanged.
+  const keptRels = keptOwners.size ? await loadMore([...keptOwners]) : new Map();
+  const updates = new Map();
+  for (const l of links) {
+    if (!updates.has(l.owner)) {
+      const kept = l.ownerKept;
+      const ownRows = kept ? keptRels.get(l.owner) : rels.get(l.owner);
+      if (!Array.isArray(ownRows)) {
+        errors.push({ app: { id: l.owner, displayName: l.ownerName }, message: ownRows ? ownRows.error : 'Relationships not loaded' });
+        updates.set(l.owner, null);
+        continue;
+      }
+      const children = ownRows.filter(r => r.targetType === 'child');
+      updates.set(l.owner, {
+        ownerId: l.owner, ownerName: l.ownerName, ownerVersion: l.ownerVersion, kept,
+        // An app being deleted drops every row it owns; a kept app drops only rows pointing at deleted apps.
+        keep: kept ? children.filter(r => !del.has(r.targetId)) : [],
+        remove: kept ? children.filter(r => del.has(r.targetId)) : children,
+      });
+    }
+  }
+  return { links, updates: [...updates.values()].filter(Boolean), errors };
 }
 
 // ---------- name matching ----------

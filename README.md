@@ -16,6 +16,8 @@ Over the years an Intune tenant collects hundreds of superseded packages — `7-
 | **Inspect** | Find many apps by name at once and see every assignment, group and version. Nothing changes. |
 | **Remove assignments** | Apps stay in Intune; assignments are removed — all, or only certain intents, targets or group names. |
 | **Delete apps** | The packages are deleted from Intune. |
+| **Unlink and delete** | Old builds superseded by a newer one, or apps other apps depend on, are unlinked first (only the links are removed — the tool can never add one), then deleted. Risky dependencies need an explicit opt-in. |
+| **Analyse** | For the apps you searched: every group per app — included / excluded, required / available / uninstall — with user, device and nested-group counts. Or search groups by name and see every app and policy they're assigned to. Drill into any group down to its nested users. |
 | **Clean up groups** | Every group taken off an app is recorded in a **Groups ledger**. Check whether each one is still used anywhere, filter by name (`SG-APP-*`), then delete, keep, or decide later. |
 
 Everything starts in **Dry run**, and the server can be locked to dry run from `config.json`.
@@ -23,12 +25,14 @@ Everything starts in **Dry run**, and the server can be locked to dry run from `
 ## Features
 
 - **Bulk search** — paste dozens of names; match by contains, exact, starts with, wildcard or regex; exclusions; lists names that matched nothing.
+- **Supersedence & dependencies handled** — reads each app's relationships, shows which links block deletion and which kept apps they touch, removes them, then deletes. The JSON backup records every link before the change.
+- **Analytics for forensics** — app × group × intent matrix, include/exclude, member counts, tenant-wide usage of any group, member drill-down through nested groups, CSV export of everything.
 - **Version-aware** — shows each app's version and filters results by version (*older than 8.0*, *is 7.\**), so you can keep the newest build and retire the rest.
 - **Granular assignment removal** — by intent (required / available / uninstall), target (included, excluded, all users, all devices) and group name pattern.
 - **Groups ledger** — remembers which groups were assigned to which apps, with member counts, group type and AD-sync status; export/import as JSON or CSV.
 - **Usage check** — before deleting a group, finds every app, configuration profile, settings catalog, compliance, ADMX, script, remediation and app configuration assignment that still uses it.
 - **Dry run everywhere** — every action can be simulated and is written to the activity log.
-- **Guard rails** — typed confirmations, automatic return to dry run, JSON backups, server-side allowlist of the only three deletes it can perform, audit log on disk.
+- **Guard rails** — typed confirmations, automatic return to dry run, JSON backups, server-side allowlist of the only writes it can perform (three deletes, plus removing app relationships — never adding them), audit log on disk.
 - **App-only auth from `config.json`** — the client secret stays in a local PowerShell process and never reaches the browser.
 - **No dependencies** — one PowerShell script and a static web page. No modules to install, no telemetry.
 
@@ -48,8 +52,8 @@ Everything starts in **Dry run**, and the server can be locked to dry run from `
 
 | Permission | Required? | Used for |
 |---|---|---|
-| `DeviceManagementApps.ReadWrite.All` | **Yes** | Read apps, versions and assignments; remove assignments; delete apps |
-| `Group.ReadWrite.All` | For group deletion | Read group details and delete groups. Use `Group.Read.All` if you never delete groups |
+| `DeviceManagementApps.ReadWrite.All` | **Yes** | Read apps, versions, assignments and relationships; remove assignments and relationships; delete apps |
+| `Group.ReadWrite.All` | For group deletion | Read groups and their members, delete groups. Use `Group.Read.All` if you never delete groups |
 | `DeviceManagementConfiguration.Read.All` | Recommended | Check whether groups are still used by policies, scripts and remediations |
 | `Organization.Read.All` | Optional | Show the tenant's domain name in the UI |
 
@@ -98,7 +102,7 @@ Step-by-step app registration, configuration and troubleshooting: **[docs/SETUP.
 | `AuthorityHost` | `https://login.microsoftonline.com` | *Optional*, for national clouds |
 | `ListenPrefix` | `http://127.0.0.1:8088/` | Local address of the UI. Must be loopback |
 | `AllowedOrigin` | empty | Only if another web origin must call the local API. `*` is ignored on purpose |
-| `EnableRealDelete` | `false` | Master switch. `false` = dry run only, enforced by the server |
+| `EnableRealDelete` | `false` | Master switch for every write (deletes and relationship removal). `false` = dry run only, enforced by the server |
 | `RequestTimeoutSeconds` | `60` | Timeout for each Graph call |
 | `ProxyUrl` | empty | Outbound proxy, e.g. `http://proxy.corp:8080` |
 | `UseDefaultProxyCredentials` | `false` | Authenticate to the proxy as the current Windows user |
@@ -126,6 +130,9 @@ Design and threat model: [docs/SECURITY-MODEL.md](docs/SECURITY-MODEL.md)
 | ![Remove assignments](docs/screenshots/06-remove-assignments.png) **Remove only what matches** | ![Delete apps](docs/screenshots/07-delete-apps-dry-run.png) **Dry run first** |
 | ![Live confirmation](docs/screenshots/10-delete-apps-live.png) **Typed confirmation in live mode** | ![Groups ledger](docs/screenshots/11-groups-ledger.png) **Groups ledger with usage check** |
 | ![Delete groups](docs/screenshots/14-delete-groups.png) **In-use and synced groups are skipped** | ![Activity log](docs/screenshots/16-activity-log.png) **Every write logged** |
+| ![Delete with links](docs/screenshots/18-delete-with-links.png) **Supersedence and dependency links, explained** | ![Unlink run](docs/screenshots/19-unlink-run.png) **Links removed, then apps deleted** |
+| ![Analytics by app](docs/screenshots/20-analytics-by-app.png) **Analytics — every group per app** | ![Analytics by group](docs/screenshots/21-analytics-by-group.png) **Analytics — everything a group is assigned to** |
+| ![Group members](docs/screenshots/22-group-members.png) **Members, including nested users** | ![Nested group](docs/screenshots/23-nested-group.png) **Drill into nested groups** |
 | ![Dry run only](docs/screenshots/12-dry-run-only.png) **Locked to dry run by config.json** | ![Dark mode](docs/screenshots/13-dark-mode.png) **Dark mode** |
 
 Walkthrough of every screen: [docs/USER-GUIDE.md](docs/USER-GUIDE.md)
@@ -134,7 +141,7 @@ Walkthrough of every screen: [docs/USER-GUIDE.md](docs/USER-GUIDE.md)
 
 - Uses Microsoft Graph **beta** endpoints for Intune apps, which Microsoft can change.
 - The usage check does **not** cover Conditional Access, app protection policies, enrollment / Autopilot profiles, Windows update profiles, or anything outside Intune.
-- Apps with dependency or supersedence relationships must be unlinked in the Intune portal before they can be deleted; the tool flags and skips them.
+- Relationship removal uses the Graph beta `updateRelationships` action. Removing a dependency from an app you keep changes how that app installs — the tool only does it when you opt in.
 - VPP and Managed Google Play apps can be re-synced from the store if they're still licensed there.
 - Deleted Microsoft 365 groups can be restored for 30 days. Treat security group deletion as permanent.
 - The local server handles one request at a time; very large tenants take a little longer to scan.

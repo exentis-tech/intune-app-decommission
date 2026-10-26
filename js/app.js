@@ -2,8 +2,9 @@ import * as auth from './auth.js';
 import { Graph, pool } from './graph.js';
 import * as I from './intune.js';
 import { createDemoTenant } from './mock.js';
+import { Analytics } from './analytics.js';
 
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 const TOOL = 'intune-app-decommission';
 
 // ---------- helpers ----------
@@ -203,6 +204,16 @@ function startSession(claims, grantedScopes, demo, backend) {
     $('#signOut').onclick = () => (demo ? location.reload() : auth.logout());
   }
   setMode('dry', true);
+  S.analytics = new Analytics($('#tab-analytics'), {
+    graph: () => S.graph,
+    visibleApps: () => (S.query ? visibleResults().filter(a => !isGone(a)) : []),
+    ensureCatalog: () => ensureCatalog(false),
+    groupsCache: S.groups,
+    canScanPolicies,
+    toast, download, csv, esc, plural, stamp,
+    openModal, closeModal,
+    onBusy: b => { S.busy = b; },
+  });
   renderAll();
 }
 
@@ -258,6 +269,7 @@ function openModal(html, wire) {
   form.innerHTML = html;
   form.onsubmit = e => e.preventDefault();
   $$('[data-close]', form).forEach(b => { b.onclick = closeModal; });
+  dlg.classList.remove('wide');
   if (!dlg.open) dlg.showModal();
   if (wire) wire(form);
   const first = $('input:not([type=checkbox]), select', form);
@@ -359,7 +371,8 @@ async function guard(fn) {
 function switchTab(tab) {
   S.tab = tab;
   $$('.tabs [data-tab]').forEach(b => b.setAttribute('aria-selected', String(b.dataset.tab === tab)));
-  for (const t of ['apps', 'groups', 'log']) $(`#tab-${t}`).hidden = t !== tab;
+  for (const t of ['apps', 'groups', 'analytics', 'log']) $(`#tab-${t}`).hidden = t !== tab;
+  if (tab === 'analytics' && S.analytics) S.analytics.refreshSourceButton();
   renderAll();
 }
 
@@ -516,7 +529,7 @@ function renderApps() {
   const rows = apps.map(app => {
     const gone = isGone(app);
     const st = S.appState.get(app.id);
-    const flags = I.appFlags(app).map(f => `<span class="chip ${f.level}">${esc(f.text)}</span>`);
+    const flags = gone ? [] : I.appFlags(app).map(f => `<span class="chip ${f.level}">${esc(f.text)}</span>`);
     if (st) flags.unshift(`<span class="chip ${st.mode === 'DRY' ? 'dry' : st.fail ? 'danger' : 'ok'}" title="${esc(st.detail || '')}">${esc(st.label)}</span>`);
     const nGroups = new Set((app.assignments || []).map(a => I.targetOf(a).groupId).filter(Boolean)).size;
     const open = S.expanded.has(app.id);
@@ -646,7 +659,7 @@ function newRun(label, count) {
   return run;
 }
 
-function backupApps(apps, action) {
+function backupApps(apps, action, plan) {
   const data = {
     tool: TOOL, version: VERSION, action, createdAt: new Date().toISOString(),
     tenant: { id: S.claims.tid, user: S.claims.upn },
@@ -655,6 +668,16 @@ function backupApps(apps, action) {
       assignments: (a.assignments || []).map(as => ({ ...as, groupName: I.targetOf(as).groupId ? I.groupName(I.targetOf(as).groupId, S.groups) : null })),
     })),
   };
+  if (plan && plan.updates && plan.updates.length) {
+    // To restore a link: POST /deviceAppManagement/mobileApps/{ownerId}/updateRelationships
+    // with { relationships: [...before] } (Graph beta).
+    data.relationshipChanges = plan.updates.map(u => ({
+      ownerId: u.ownerId, ownerName: u.ownerName, ownerVersion: u.ownerVersion, ownerKept: u.kept,
+      before: [...u.keep, ...u.remove].map(I.relationshipBody),
+      after: u.keep.map(I.relationshipBody),
+      removed: u.remove.map(r => ({ targetId: r.targetId, targetName: r.targetDisplayName, targetVersion: r.targetDisplayVersion, ...I.relationshipBody(r) })),
+    }));
+  }
   download(`backup-${action}-${stamp()}.json`, JSON.stringify(data, null, 2), 'application/json');
 }
 
@@ -866,16 +889,73 @@ async function finishRun(ui, run, stats, groupCount) {
 }
 
 // ---------- delete apps ----------
-function openDeleteApps() {
+const relCache = { rels: new Map() };
+
+async function relationshipsFor(ids) {
+  const need = ids.filter(id => !relCache.rels.has(id));
+  if (need.length) {
+    const got = await I.loadRelationships(S.graph, need);
+    for (const [k, v] of got) relCache.rels.set(k, v);
+  }
+  return new Map(ids.map(id => [id, relCache.rels.get(id)]));
+}
+
+const LINK_TEXT = {
+  internal: 'Between apps you are deleting',
+  supersededBy: 'Kept apps that supersede an app you are deleting',
+  dependedOnBy: 'Kept apps that DEPEND on an app you are deleting',
+  outbound: 'Apps you are deleting that supersede or depend on kept apps',
+};
+const LINK_HELP = {
+  internal: 'Removed. Both ends are being deleted.',
+  supersededBy: 'The supersedence entry is removed from the kept (newer) app. Devices keep what they have installed; the old version just stops being referenced.',
+  dependedOnBy: 'Risk: the kept app would no longer install this prerequisite. Only remove if the kept app no longer needs it, or replace the dependency first.',
+  outbound: 'Removed together with the app being deleted. The kept app is not changed.',
+};
+
+function linkLine(l) {
+  const verb = l.kind === 'dependency' ? 'depends on' : 'supersedes';
+  const v = x => (x ? ` <span class="sub">${esc(x)}</span>` : '');
+  return `<li><b>${esc(l.ownerName)}</b>${v(l.ownerVersion)} ${verb} <b>${esc(l.otherName)}</b>${v(l.otherVersion)}${l.detail ? ` <span class="chip">${esc(l.detail)}</span>` : ''}</li>`;
+}
+
+async function openDeleteApps() {
   const apps = selectedApps();
-  const blocked = apps.filter(I.blocksDelete);
   const synced = apps.filter(a => I.appFlags(a).some(f => f.key === 'synced'));
+  relCache.rels.clear();
+  openModal(`<h2 id="modalTitle">Delete ${plural(apps.length, 'app')} ${modeTag()}</h2><div class="preview" data-load>Checking supersedence and dependency relationships…</div>
+    <div class="modal-actions"><button type="button" class="btn ghost" data-close>Cancel</button></div>`);
+  S.busy = true;
+  let rels;
+  try {
+    rels = await relationshipsFor(apps.map(a => a.id));
+  } finally { S.busy = false; }
+  if (!$('#modal').open) return;
+  const linked = apps.filter(a => { const r = rels.get(a.id); return !Array.isArray(r) || r.length > 0; });
+  const basePlan = linked.length ? await I.planUnlink(apps, rels, relationshipsFor) : { links: [], updates: [], errors: [] };
+  const riskyTargets = new Set(basePlan.links.filter(l => l.category === 'dependedOnBy').map(l => l.other));
+  const errorIds = new Set(basePlan.errors.map(e => e.app.id));
+
+  const groupsHtml = ['internal', 'supersededBy', 'dependedOnBy', 'outbound'].map(cat => {
+    const ls = basePlan.links.filter(l => l.category === cat);
+    if (!ls.length) return '';
+    return `<details ${cat === 'dependedOnBy' ? 'open' : ''} class="${cat === 'dependedOnBy' ? 'risk' : ''}"><summary>${LINK_TEXT[cat]} <b>${ls.length}</b></summary>
+      <p class="sub">${LINK_HELP[cat]}</p><ul class="list-compact">${ls.map(linkLine).join('')}</ul></details>`;
+  }).join('');
+
   openModal(`
     <h2 id="modalTitle">Delete ${plural(apps.length, 'app')} ${modeTag()}</h2>
     <p class="sub">Deleting an app removes the package and all its assignments from Intune. The groups it was assigned to are recorded in the Groups ledger, so you can decide about them next.</p>
-    ${blocked.length ? `<div class="notice warn"><b>${plural(blocked.length, 'app')}</b> ${blocked.length === 1 ? 'has' : 'have'} dependency or supersedence relationships; Intune refuses to delete ${blocked.length === 1 ? 'it' : 'them'} until those are removed.
-      <ul class="list-compact">${blocked.map(a => `<li>${esc(a.displayName)}</li>`).join('')}</ul>
-      <label class="check"><input type="checkbox" name="skipBlocked" checked> Skip these apps</label></div>` : ''}
+    ${linked.length ? `<div class="notice warn rel-box">
+      <p class="rel-msg"><b>${plural(linked.length, 'app')}</b> ${linked.length === 1 ? 'has' : 'have'} supersedence or dependency relationships (${plural(basePlan.links.length, 'link')}). Intune refuses to delete an app until its links are removed.</p>
+      <div class="radio-col">
+        <label class="check"><input type="radio" name="relMode" value="unlink" checked> Remove the links first, then delete <span class="muted">(recommended for old versions)</span></label>
+        <label class="check"><input type="radio" name="relMode" value="skip"> Skip these ${plural(linked.length, 'app')}, delete the rest</label>
+      </div>
+      <div class="rel-groups">${groupsHtml}</div>
+      ${riskyTargets.size ? `<label class="check risk-opt"><input type="checkbox" name="dropDeps"> Also remove dependencies from kept apps (otherwise the ${plural(riskyTargets.size, 'prerequisite app')} they need ${riskyTargets.size === 1 ? 'is' : 'are'} skipped)</label>` : ''}
+      ${basePlan.errors.length ? `<div class="notice danger">Couldn't read relationships of ${plural(basePlan.errors.length, 'app')}; ${basePlan.errors.length === 1 ? 'it' : 'they'} will be skipped: ${basePlan.errors.map(e => esc(e.app.displayName)).join(', ')}</div>` : ''}
+    </div>` : ''}
     ${synced.length ? `<div class="notice info">${plural(synced.length, 'app')} ${synced.length === 1 ? 'is' : 'are'} synced from a store (VPP / Managed Google Play). Remove ${synced.length === 1 ? 'it' : 'them'} from the store side too, or ${synced.length === 1 ? 'it' : 'they'} may come back.</div>` : ''}
     <div class="preview" data-preview></div>
     ${confirmBlock('DELETE')}
@@ -884,31 +964,85 @@ function openDeleteApps() {
       <button type="button" class="btn danger" data-go>${S.dry ? 'Simulate deletion' : 'Delete apps'}</button>
     </div>`, form => {
     let targets = [];
-    const preview = () => {
-      targets = form.skipBlocked && form.skipBlocked.checked ? apps.filter(a => !I.blocksDelete(a)) : apps;
-      const as = targets.reduce((s, a) => s + (a.assignments || []).length, 0);
+    let plan = null;
+    let seq = 0;
+    const preview = async () => {
+      const my = ++seq;
+      const mode = form.relMode ? form.querySelector('[name=relMode]:checked').value : 'skip';
+      const dropDeps = !!(form.dropDeps && form.dropDeps.checked);
+      if (form.dropDeps) form.dropDeps.disabled = mode !== 'unlink';
+      const linkedIds = new Set(linked.map(a => a.id));
+      targets = apps.filter(a => {
+        if (errorIds.has(a.id)) return false;
+        if (mode === 'skip') return !linkedIds.has(a.id);
+        return dropDeps || !riskyTargets.has(a.id);
+      });
+      plan = mode === 'unlink' && targets.some(a => linkedIds.has(a.id))
+        ? await I.planUnlink(targets, rels, relationshipsFor)
+        : { links: [], updates: [], errors: [] };
+      if (my !== seq) return;
+      // An app whose own links (or a kept owner's links) can't be read stays out.
+      const badOwners = new Set(plan.errors.map(e => e.app.id));
+      targets = targets.filter(a => !badOwners.has(a.id) && !plan.links.some(l => (l.other === a.id || l.owner === a.id) && badOwners.has(l.owner)));
+      const as = targets.reduce((n, a) => n + (a.assignments || []).length, 0);
       const groups = I.groupIdsOf(targets).length;
-      $('[data-preview]', form).innerHTML = `Will delete <b>${plural(targets.length, 'app')}</b> with ${plural(as, 'assignment')}. <b>${plural(groups, 'group')}</b> will be recorded in the ledger.`;
+      const keptChanged = plan.updates.filter(u => u.kept);
+      $('[data-preview]', form).innerHTML =
+        (plan.updates.length ? `First remove <b>${plural(plan.links.length, 'link')}</b> on ${plural(plan.updates.length, 'app')}${keptChanged.length ? ` (<b>${keptChanged.length}</b> of them kept: ${keptChanged.slice(0, 4).map(u => esc(u.ownerName + (u.ownerVersion ? ' ' + u.ownerVersion : ''))).join(', ')}${keptChanged.length > 4 ? '…' : ''})` : ''}, then ` : '')
+        + `${plan.updates.length ? 'delete' : 'Will delete'} <b>${plural(targets.length, 'app')}</b> with ${plural(as, 'assignment')}. <b>${plural(groups, 'group')}</b> will be recorded in the ledger.`
+        + (apps.length > targets.length ? `<div class="sub">${plural(apps.length - targets.length, 'app')} skipped.</div>` : '');
+      updateGo();
     };
-    form.addEventListener('input', preview);
+    form.addEventListener('change', preview);
+    const updateGo = wireConfirm(form, 'DELETE', () => targets.length > 0);
     preview();
-    wireConfirm(form, 'DELETE', () => targets.length > 0);
-    $('[data-go]', form).onclick = () => guard(() => runDeleteApps(targets, form.backup && form.backup.checked));
+    $('[data-go]', form).onclick = () => guard(() => runDeleteApps(targets, form.backup && form.backup.checked, plan));
   });
 }
 
-async function runDeleteApps(apps, backup) {
-  if (backup) backupApps(apps, 'delete-apps');
+async function runDeleteApps(apps, backup, plan = { links: [], updates: [] }) {
+  if (backup) backupApps(apps, 'delete-apps', plan);
   const run = newRun('Delete apps', apps.length);
   const dry = run.mode === 'DRY';
   S.busy = true;
-  const ui = progressView('Deleting apps', apps.length);
-  let ok = 0, fail = 0;
+  const ui = progressView(plan.updates.length ? 'Removing links, then deleting apps' : 'Deleting apps', plan.updates.length + apps.length);
+  let ok = 0, fail = 0, unlinked = 0;
   const groups = new Set();
+  const blocked = new Map(); // appId -> reason (an unlink it needed failed)
+
+  // Phase 1: rewrite the relationships of every owner app.
+  await pool(plan.updates, 3, async u => {
+    const removed = u.remove.map(r => r.targetDisplayName + (r.targetDisplayVersion ? ' ' + r.targetDisplayVersion : ''));
+    const label = `${u.ownerName}${u.ownerVersion ? ' ' + u.ownerVersion : ''}${u.kept ? ' (kept)' : ''}`;
+    try {
+      await S.graph.mutate('POST', `/deviceAppManagement/mobileApps/${u.ownerId}/updateRelationships`,
+        { action: u.kept ? 'Remove links (kept app)' : 'Remove links', target: label, targetId: u.ownerId, runId: run.id,
+          detail: `removed: ${removed.join(', ')}${u.keep.length ? ` · kept ${u.keep.length}` : ''}` },
+        { relationships: u.keep.map(I.relationshipBody) });
+      unlinked += u.remove.length;
+      if (!dry) {
+        const cached = relCache.rels.get(u.ownerId);
+        if (Array.isArray(cached)) relCache.rels.set(u.ownerId, cached.filter(r => r.targetType !== 'child' || u.keep.some(k => k.targetId === r.targetId)));
+      }
+      ui.step(`${dry ? '[dry] ' : ''}unlinked ${label} → ${removed.join(', ')}`, 's');
+    } catch (e) {
+      ui.step(`FAILED   unlink ${label} — ${e.message}`, 'f');
+      for (const r of u.remove) blocked.set(r.targetId, `Removing the link from ${u.ownerName} failed`);
+      if (!u.kept) blocked.set(u.ownerId, 'Removing its links failed');
+    }
+  });
+
+  // Phase 2: delete.
   await pool(apps, 4, async app => {
+    if (blocked.has(app.id)) {
+      fail++;
+      S.appState.set(app.id, { mode: run.mode, fail: true, label: 'Skipped', detail: blocked.get(app.id) });
+      ui.step(`SKIPPED  ${app.displayName} — ${blocked.get(app.id)}`, 'f');
+      return;
+    }
     try {
       const r = await S.graph.mutate('DELETE', `/deviceAppManagement/mobileApps/${app.id}`,
-        { action: 'Delete app', target: app.displayName, targetId: app.id, runId: run.id,
+        { action: 'Delete app', target: app.displayName + (I.appVersion(app).value ? ' ' + I.appVersion(app).value : ''), targetId: app.id, runId: run.id,
           detail: `${(app.assignments || []).length} assignment(s)` });
       for (const a of app.assignments || []) {
         const gid = I.targetOf(a).groupId;
@@ -918,7 +1052,7 @@ async function runDeleteApps(apps, backup) {
       S.appState.set(app.id, dry
         ? { mode: 'DRY', label: 'Would delete' }
         : { mode: 'LIVE', label: r.gone ? 'Already deleted' : 'Deleted', gone: true });
-      ui.step(`${dry ? '[dry] ' : ''}deleted  ${app.displayName}`, 's');
+      ui.step(`${dry ? '[dry] ' : ''}deleted  ${app.displayName}${I.appVersion(app).value ? ' ' + I.appVersion(app).value : ''}`, 's');
     } catch (e) {
       fail++;
       S.appState.set(app.id, { mode: run.mode, fail: true, label: 'Delete failed', detail: e.message });
@@ -929,17 +1063,24 @@ async function runDeleteApps(apps, backup) {
     const gone = new Set(apps.filter(a => isGone(a)).map(a => a.id));
     if (S.catalog) S.catalog = S.catalog.filter(a => !gone.has(a.id));
     gone.forEach(id => S.selected.delete(id));
+    // Re-read relationships of the remaining results so their flags are current.
+    if (plan.updates.length) {
+      const left = S.results.filter(a => !isGone(a));
+      try {
+        const fresh = await I.loadRelationships(S.graph, left.map(a => a.id));
+        for (const a of left) I.applyRelationshipCounts(a, fresh.get(a.id));
+      } catch { /* flags stay as they were */ }
+    }
   }
   S.busy = false;
   saveLedger();
   afterLiveRun();
   renderApps();
   renderActionbar();
-  finishRun(ui, run, [
-    [ok, dry ? 'would be deleted' : 'deleted'],
-    [fail, 'failed'],
-    [groups.size, 'groups recorded'],
-  ], groups.size);
+  const stats = [];
+  if (plan.updates.length) stats.push([unlinked, dry ? 'links would be removed' : 'links removed']);
+  stats.push([ok, dry ? 'would be deleted' : 'deleted'], [fail, 'failed / skipped'], [groups.size, 'groups recorded']);
+  finishRun(ui, run, stats, groups.size);
 }
 
 // ---------- groups ledger ----------

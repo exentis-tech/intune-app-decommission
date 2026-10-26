@@ -83,3 +83,61 @@ test('apps with relationships are flagged as not deletable', () => {
   assert.ok(!blocksDelete(app('A')));
   assert.ok(appFlags(app('A', { '@odata.type': '#microsoft.graph.iosVppApp' })).some(f => f.key === 'synced'));
 });
+
+// ---------- relationships ----------
+import { Graph } from '../js/graph.js';
+import { createDemoTenant } from '../js/mock.js';
+import { loadRelationships, planUnlink, relationshipBody } from '../js/intune.js';
+
+async function demo() {
+  const t = createDemoTenant();
+  const g = new Graph({ mock: t, isDryRun: () => false });
+  const list = (await g.getAll('/deviceAppManagement/mobileApps'));
+  const find = (name, ver) => list.find(a => a.displayName === name && (!ver || a.displayVersion === ver));
+  const load = ids => loadRelationships(g, ids);
+  return { t, g, list, find, load };
+}
+
+test('planUnlink: old builds in a supersedence chain, newest kept', async () => {
+  const { find, load } = await demo();
+  const del = ['7.6.2', '7.9.1', '8.0.4'].map(v => find('AnyDesk_User', v));
+  const kept = find('AnyDesk_User', '8.1.0');
+  const plan = await planUnlink(del, await load(del.map(a => a.id)), load);
+  assert.deepEqual(plan.errors, []);
+  const cats = plan.links.map(l => l.category).sort();
+  assert.deepEqual(cats, ['internal', 'internal', 'supersededBy']);
+  const keptUpdate = plan.updates.find(u => u.ownerId === kept.id);
+  assert.ok(keptUpdate.kept);
+  assert.equal(keptUpdate.remove.length, 1);
+  assert.equal(keptUpdate.keep.length, 0);
+});
+
+test('planUnlink: a kept app depending on a deleted app is flagged as risky', async () => {
+  const { find, load } = await demo();
+  const java = find('Java Runtime 8u202');
+  const plan = await planUnlink([java], await load([java.id]), load);
+  assert.equal(plan.links.length, 1);
+  assert.equal(plan.links[0].category, 'dependedOnBy');
+  assert.equal(plan.links[0].ownerName, 'Contoso ERP Client');
+});
+
+test('unlink then delete works; deleting without unlinking is refused', async () => {
+  const { g, find, load } = await demo();
+  const npp = find('Notepad++ 8.4.2');
+  await assert.rejects(() => g.send('DELETE', `/deviceAppManagement/mobileApps/${npp.id}`), /relationships/);
+  const plan = await planUnlink([npp], await load([npp.id]), load);
+  for (const u of plan.updates) {
+    await g.send('POST', `/deviceAppManagement/mobileApps/${u.ownerId}/updateRelationships`, { body: { relationships: u.keep.map(relationshipBody) } });
+  }
+  await g.send('DELETE', `/deviceAppManagement/mobileApps/${npp.id}`);
+  const newer = find('Notepad++ 8.6.4');
+  const left = (await load([newer.id])).get(newer.id);
+  assert.deepEqual(left, [], 'the kept app no longer points at the deleted one');
+});
+
+test('relationshipBody keeps type-specific fields', () => {
+  assert.deepEqual(relationshipBody({ '@odata.type': '#microsoft.graph.mobileAppSupersedence', targetId: 'x', supersedenceType: 'replace' }),
+    { '@odata.type': '#microsoft.graph.mobileAppSupersedence', targetId: 'x', supersedenceType: 'replace' });
+  assert.deepEqual(relationshipBody({ '@odata.type': '#microsoft.graph.mobileAppDependency', targetId: 'y', dependencyType: 'detect' }),
+    { '@odata.type': '#microsoft.graph.mobileAppDependency', targetId: 'y', dependencyType: 'detect' });
+});

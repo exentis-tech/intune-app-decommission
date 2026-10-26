@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] - 2026-10-26
+
+### Added
+- **Supersedence and dependency handling when deleting apps.** The Delete dialog reads each app's relationships, groups them (between deleted apps / kept app supersedes a deleted one / kept app depends on a deleted one / deleted app points at a kept one), removes the links with `updateRelationships`, then deletes. Dependencies of kept apps require an explicit opt-in. Failed unlinks skip the apps that needed them.
+- JSON backup now records every relationship change (`before` / `after`).
+- **Analytics tab**: by app (every assignment with intent, include/exclude, group type, users, devices, nested groups, all nested users, filter), by group (everything a group is assigned to, optional tenant-wide scan of apps and policies), group search by name / wildcard / ID, member drill-down through nested groups, copy and CSV export.
+- Demo tenant with real supersedence chains, a dependency, and group membership (users, devices, nested groups).
+
+### Security
+- New write `POST /deviceAppManagement/mobileApps/{id}/updateRelationships`, gated by `EnableRealDelete` and checked server-side to only **remove** existing links (`OnlyRemovalAllowed` otherwise). Request bodies are written to the audit log.
+
 ## [1.0.0] - 2026-10-26
 
 First public release.

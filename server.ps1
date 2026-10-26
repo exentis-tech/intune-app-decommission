@@ -11,8 +11,10 @@
       * Listens on loopback only (127.0.0.1 / localhost / ::1).
       * Every API call needs a per-launch session token.
       * Reads are limited to deviceAppManagement, deviceManagement, groups and organization.
-      * Writes are limited to three DELETE shapes: an app, an app assignment, a group.
-      * With "EnableRealDelete": false, every DELETE is refused (dry run only).
+      * Writes are limited to three DELETE shapes (an app, an app assignment, a group)
+        and to updateRelationships calls that only REMOVE existing supersedence /
+        dependency links (checked against the app's current relationships).
+      * With "EnableRealDelete": false, every write is refused (dry run only).
       * Every write attempt is appended to logs/audit-<date>.jsonl.
 
 .PARAMETER ConfigPath
@@ -35,7 +37,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
-$Version = '1.0.0'
+$Version = '1.1.0'
 $WebRoot = [IO.Path]::GetFullPath($PSScriptRoot)
 Add-Type -AssemblyName System.Net.Http
 # Windows PowerShell 5.1 on older .NET Framework may not offer TLS 1.2 by default.
@@ -185,6 +187,24 @@ $WriteAllow = @(
     '^/deviceAppManagement/mobileApps/[^/]+/assignments/[^/]+$',
     '^/groups/[^/]+$'
 )
+
+$UnlinkAllow = '^/deviceAppManagement/mobileApps/([^/]+)/updateRelationships$'
+
+# An updateRelationships body may only keep a subset of the app's current outbound links.
+function Test-OnlyRemovesLinks([string]$Base, [string]$AppId, [string]$Body) {
+    try { $posted = @(($Body | ConvertFrom-Json).relationships) } catch { return 'Body is not valid JSON.' }
+    $r = Invoke-Graph 'GET' ("$Base/deviceAppManagement/mobileApps/$AppId/relationships") $null $null
+    if ($r.Status -ne 200) { return "Could not read current relationships (HTTP $($r.Status))." }
+    $current = @(([Text.Encoding]::UTF8.GetString($r.Bytes) | ConvertFrom-Json).value | Where-Object { $_.targetType -eq 'child' })
+    $have = @{}
+    foreach ($c in $current) { $have[('{0}|{1}' -f $c.'@odata.type', $c.targetId).ToLowerInvariant()] = $true }
+    foreach ($p in $posted) {
+        if ($null -eq $p) { continue }
+        $key = ('{0}|{1}' -f $p.'@odata.type', $p.targetId).ToLowerInvariant()
+        if (-not $have.ContainsKey($key)) { return "Would add or change the link to $($p.targetId); this tool may only remove links." }
+    }
+    return $null
+}
 
 function Test-WriteAllowed([string]$Path) {
     foreach ($re in $WriteAllow) { if ($Path -match $re) { return $true } }
@@ -364,6 +384,19 @@ function Invoke-GraphProxy($Ctx) {
                 return Send-Error $Ctx 403 'NotAllowed' 'Only read requests are allowed inside $batch.' $cors
             }
         }
+    } elseif ($method -eq 'POST' -and $path -match $UnlinkAllow) {
+        $isWrite = $true
+        $appId = $Matches[1]
+        if (-not $Cfg.EnableRealDelete) {
+            Write-Audit @{ method = $method; path = $path; result = 'blocked'; reason = 'EnableRealDelete=false'; body = $body }
+            Write-Info "BLOCKED  POST $path (EnableRealDelete is false)" 'Yellow'
+            return Send-Error $Ctx 403 'RealDeleteDisabled' 'EnableRealDelete is false in config.json, so the server refused this change.' $cors
+        }
+        $why = Test-OnlyRemovesLinks $base $appId $body
+        if ($why) {
+            Write-Audit @{ method = $method; path = $path; result = 'blocked'; reason = $why; body = $body }
+            return Send-Error $Ctx 403 'OnlyRemovalAllowed' $why $cors
+        }
     } elseif ($method -eq 'DELETE') {
         $isWrite = $true
         if (-not (Test-WriteAllowed $path)) {
@@ -386,8 +419,10 @@ function Invoke-GraphProxy($Ctx) {
     $r = Invoke-Graph $method ($base + $rawPath + $query) $body $headers
     if ($isWrite) {
         $ok = $r.Status -ge 200 -and $r.Status -lt 300
-        Write-Audit @{ method = $method; path = $path; status = $r.Status; result = $(if ($ok) { 'success' } else { 'failed' }) }
-        Write-Info ('{0}  DELETE {1} -> {2}' -f $(if ($ok) { 'DONE   ' } else { 'FAILED ' }), $path, $r.Status) $(if ($ok) { 'Green' } else { 'Red' })
+        $entry = @{ method = $method; path = $path; status = $r.Status; result = $(if ($ok) { 'success' } else { 'failed' }) }
+        if ($method -eq 'POST') { $entry['body'] = $body }
+        Write-Audit $entry
+        Write-Info ('{0}  {1} {2} -> {3}' -f $(if ($ok) { 'DONE   ' } else { 'FAILED ' }), $method, $path, $r.Status) $(if ($ok) { 'Green' } else { 'Red' })
     }
     $extra = @{} + $cors
     if ($null -ne $r.RetryAfter) { $extra['Retry-After'] = $r.RetryAfter }

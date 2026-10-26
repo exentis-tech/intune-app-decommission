@@ -52,13 +52,70 @@ export function createDemoTenant() {
   };
   const ghostGroupId = guid(); // assigned somewhere but already deleted in Entra
 
+  // ---- directory: users, devices and nested groups (generated with their own RNG so app data stays stable)
+  let s2 = 4242;
+  const r2 = () => { s2 = (s2 * 1103515245 + 12345) % 2147483648; return s2 / 2147483648; };
+  const hx = n => Array.from({ length: n }, () => Math.floor(r2() * 16).toString(16)).join('');
+  const gid2 = () => `${hx(8)}-${hx(4)}-4${hx(3)}-b${hx(3)}-${hx(12)}`;
+  const FIRST = ['Jane', 'Omar', 'Li', 'Ana', 'Tom', 'Sara', 'Ravi', 'Emma', 'Yuki', 'Leo', 'Noor', 'Paul', 'Ines', 'Karim', 'Mia', 'Hugo', 'Lea', 'Sami', 'Nina', 'Ali'];
+  const LAST = ['Doe', 'Haddad', 'Wang', 'Silva', 'Becker', 'Nilsson', 'Kumar', 'Brown', 'Tanaka', 'Rossi', 'Saleh', 'Martin', 'Garcia', 'Ben Ali', 'Muller', 'Dubois', 'Costa', 'Trabelsi', 'Novak', 'Lindqvist'];
+  const people = [];
+  for (let i = 0; i < 420; i++) {
+    const f = FIRST[i % FIRST.length], l = LAST[Math.floor(i / FIRST.length) % LAST.length];
+    const upn = `${f}.${l}${i >= 400 ? i : ''}@contoso-demo.com`.toLowerCase().replace(/ /g, '');
+    people.push({ '@odata.type': '#microsoft.graph.user', id: gid2(), displayName: `${f} ${l}`, userPrincipalName: upn, mail: upn, accountEnabled: r2() > 0.05 });
+  }
+  const machines = [];
+  for (let i = 1; i <= 380; i++) {
+    const os = i % 9 === 0 ? 'iOS' : i % 13 === 0 ? 'Android' : 'Windows';
+    machines.push({ '@odata.type': '#microsoft.graph.device', id: gid2(), deviceId: gid2(), displayName: os === 'Windows' ? `CTS-LT-${String(i).padStart(4, '0')}` : `${os}-${hx(6).toUpperCase()}`, operatingSystem: os, accountEnabled: true });
+  }
+  const DEVICE_GROUPS = /^(SG-Devices|DYN-|AD-Workstations|SG-APP-7Zip-22.01-Uninstall)/;
+  const NESTED = { // parent group -> child groups
+    'SG-APP-7Zip-19.00-Required': ['SG-Pilot-Ring', 'SG-APP-Putty-0.76'],
+    'SG-APP-AcrobatReader-2021-Users': ['SG-Pilot-Ring'],
+    'SG-APP-Java8u202-Required': ['SG-Devices-Finance'],
+    'SG-APP-WinRAR-Retired': ['SG-APP-FileZilla-Old', 'SG-APP-Zoom-5.10-Available'],
+  };
+  const byName = name => [...groups.values()].find(g => g.displayName === name);
+  function membersOf(g) {
+    if (g._list) return g._list;
+    const pool = DEVICE_GROUPS.test(g.displayName) ? machines : people;
+    const n = Math.min(g._members, pool.length);
+    const start = Math.floor(r2() * pool.length);
+    const list = Array.from({ length: n }, (_, k) => pool[(start + k * 7) % pool.length]);
+    for (const child of NESTED[g.displayName] || []) { const c = byName(child); if (c) list.push({ '@odata.type': '#microsoft.graph.group', ...pubGroup(c) }); }
+    g._list = [...new Map(list.map(o => [o.id, o])).values()];
+    return g._list;
+  }
+  function transitive(g, seen = new Set()) {
+    const out = [];
+    for (const m of membersOf(g)) {
+      if (m['@odata.type'] === '#microsoft.graph.group') {
+        if (seen.has(m.id)) continue;
+        seen.add(m.id);
+        out.push(m, ...transitive(groups.get(m.id), seen));
+      } else out.push(m);
+    }
+    return [...new Map(out.map(o => [o.id, o])).values()];
+  }
+  const pubGroup = g => Object.fromEntries(Object.entries(g).filter(([k]) => !k.startsWith('_')));
+  function pageOf(list, q, rawUrl) {
+    const top = Math.min(Number(q.get('$top') || 100), 999);
+    const skip = Number(q.get('$skiptoken') || 0);
+    const body = { value: list.slice(skip, skip + top) };
+    if (q.get('$count') === 'true') body['@odata.count'] = list.length;
+    if (skip + top < list.length) { const u = new URL(rawUrl, 'https://graph.microsoft.com'); u.searchParams.set('$skiptoken', String(skip + top)); body['@odata.nextLink'] = u.toString(); }
+    return body;
+  }
+
   const apps = new Map();
   const mkApp = (name, type, publisher, assigns = [], extra = {}) => {
     const id = guid();
     const app = {
       '@odata.type': `#microsoft.graph.${type}`, id, displayName: name, publisher,
       createdDateTime: daysAgo(300 + Math.floor(rnd() * 900)), lastModifiedDateTime: daysAgo(30 + Math.floor(rnd() * 600)),
-      dependentAppCount: 0, supersedingAppCount: 0, supersededAppCount: 0, ...extra,
+      ...extra,
     };
     app._assignments = assigns.map(([kind, intent, groupId, filter]) => {
       const target =
@@ -71,9 +128,12 @@ export function createDemoTenant() {
       return { id: `${groupId || kind}_${intent}_${Math.floor(rnd() * 1e6)}`, intent, source: 'direct', target };
     });
     app.isAssigned = app._assignments.length > 0;
+    app._rels = []; // outbound relationships this app owns: { kind, targetId, supersedenceType | dependencyType }
     apps.set(id, app);
     return app;
   };
+  const supersede = (newer, older, type = 'update') => newer._rels.push({ kind: 'supersedence', targetId: older.id, supersedenceType: type });
+  const dependOn = (app, prereq, type = 'autoInstall') => app._rels.push({ kind: 'dependency', targetId: prereq.id, dependencyType: type });
 
   const W = 'win32LobApp';
   mkApp('7-Zip 19.00', W, 'Igor Pavlov', [['include', 'required', G.zip19.id], ['include', 'required', G.finance.id]]);
@@ -84,9 +144,12 @@ export function createDemoTenant() {
   mkApp('Google Chrome 98 (Legacy)', 'windowsMobileMSI', 'Google', [['include', 'required', G.chrome98.id], ['include', 'required', ghostGroupId]]);
   mkApp('Google Chrome Enterprise', W, 'Google', [['allDevices', 'required', null, guid()]]);
   mkApp('Notepad++ 7.9.5', W, 'Notepad++ Team', [['include', 'required', G.npp795.id]]);
-  mkApp('Notepad++ 8.4.2', W, 'Notepad++ Team', [['include', 'required', G.npp842.id], ['include', 'available', G.dynWin10.id]], { supersededAppCount: 1 });
-  mkApp('Notepad++ 8.6.4', W, 'Notepad++ Team', [['include', 'required', G.npp842.id]], { supersedingAppCount: 1 });
-  mkApp('Java Runtime 8u202', W, 'Oracle', [['include', 'required', G.java202.id]], { dependentAppCount: 1 });
+  const npp842 = mkApp('Notepad++ 8.4.2', W, 'Notepad++ Team', [['include', 'required', G.npp842.id], ['include', 'available', G.dynWin10.id]]);
+  const npp864 = mkApp('Notepad++ 8.6.4', W, 'Notepad++ Team', [['include', 'required', G.npp842.id]]);
+  supersede(npp864, npp842);
+  const java202 = mkApp('Java Runtime 8u202', W, 'Oracle', [['include', 'required', G.java202.id]]);
+  const erp = mkApp('Contoso ERP Client', W, 'Contoso IT', [['include', 'required', G.finance.id]]);
+  dependOn(erp, java202);
   mkApp('Java Runtime 8u381', W, 'Oracle', [['include', 'required', G.java381.id]]);
   mkApp('Zoom Client 5.10', 'windowsMobileMSI', 'Zoom', [['include', 'available', G.zoom510.id], ['allUsers', 'available', null]]);
   mkApp('Zoom Workplace', W, 'Zoom', [['allUsers', 'available', null]]);
@@ -103,9 +166,10 @@ export function createDemoTenant() {
   mkApp('Company Portal', 'winGetApp', 'Microsoft Corporation', [['allDevices', 'required', null]]);
   mkApp('Microsoft Authenticator', 'iosVppApp', 'Microsoft Corporation', [['allUsers', 'available', null]]);
   mkApp('Outlook (Android)', 'androidManagedStoreApp', 'Microsoft Corporation', [['allUsers', 'available', null]]);
-  for (const [v, a] of [['7.6.2', []], ['7.9.1', [['include', 'required', G.pilot.id]]], ['8.0.4', [['include', 'required', G.pilot.id], ['include', 'uninstall', G.winrar.id]]], ['8.1.0', [['allUsers', 'available', null]]]]) {
-    mkApp('AnyDesk_User', W, 'AnyDesk', a, { displayVersion: v });
-  }
+  // A supersedence chain, newest last: each build supersedes the previous one.
+  const anydesk = [['7.6.2', []], ['7.9.1', [['include', 'required', G.pilot.id]]], ['8.0.4', [['include', 'required', G.pilot.id], ['include', 'uninstall', G.winrar.id]]], ['8.1.0', [['allUsers', 'available', null]]]]
+    .map(([v, a]) => mkApp('AnyDesk_User', W, 'AnyDesk', a, { displayVersion: v }));
+  for (let i = 1; i < anydesk.length; i++) supersede(anydesk[i], anydesk[i - 1], i === anydesk.length - 1 ? 'replace' : 'update');
   for (const [v, a] of [['3.4.1', [['include', 'required', G.filezilla.id]]], ['3.10.0', [['allUsers', 'available', null]]]]) {
     mkApp('Contoso Agent', 'windowsMobileMSI', 'Contoso IT', a, { productVersion: v });
   }
@@ -134,6 +198,28 @@ export function createDemoTenant() {
   const json = (status, body, headers) => ({ status, body, headers: headers || {} });
   const err = (status, code, message) => json(status, { error: { code, message } });
 
+  const inbound = app => [...apps.values()].flatMap(src => src._rels.filter(r => r.targetId === app.id).map(r => ({ ...r, source: src })));
+  function pubApp(app) {
+    const out = Object.fromEntries(Object.entries(app).filter(([k]) => !k.startsWith('_')));
+    const inb = inbound(app);
+    out.dependentAppCount = inb.filter(r => r.kind === 'dependency').length;
+    out.supersedingAppCount = app._rels.filter(r => r.kind === 'supersedence').length;
+    out.supersededAppCount = inb.filter(r => r.kind === 'supersedence').length;
+    return out;
+  }
+  const relRow = (r, other, targetType, source) => ({
+    '@odata.type': `#microsoft.graph.mobileApp${r.kind === 'dependency' ? 'Dependency' : 'Supersedence'}`,
+    id: `${source.id}_${r.targetId}`,
+    targetId: other.id, targetDisplayName: other.displayName, targetDisplayVersion: other.displayVersion || other.productVersion || null,
+    targetPublisher: other.publisher, targetType, sourceId: source.id, sourceDisplayName: source.displayName,
+    ...(r.kind === 'dependency' ? { dependencyType: r.dependencyType } : { supersedenceType: r.supersedenceType }),
+  });
+  function relationshipsOf(app) {
+    const out = app._rels.map(r => relRow(r, apps.get(r.targetId), 'child', app));
+    for (const r of inbound(app)) out.push(relRow(r, r.source, 'parent', r.source));
+    return out;
+  }
+
   function strip(u) {
     const url = new URL(u, 'https://graph.microsoft.com');
     return { path: url.pathname.replace(/^\/(beta|v1\.0)/, ''), q: url.searchParams };
@@ -154,7 +240,7 @@ export function createDemoTenant() {
     }
 
     if (method === 'GET' && path === '/deviceAppManagement/mobileApps') {
-      const all = [...apps.values()].map(({ _assignments, ...a }) => a);
+      const all = [...apps.values()].map(pubApp);
       const skip = Number(q.get('$skiptoken') || 0);
       const page = all.slice(skip, skip + 40);
       const out = { value: page };
@@ -177,27 +263,55 @@ export function createDemoTenant() {
     if ((m = path.match(/^\/deviceAppManagement\/mobileApps\/([^/]+)$/)) && method === 'GET') {
       const app = apps.get(m[1]);
       if (!app) return err(404, 'ResourceNotFound', 'App not found');
-      const { _assignments, ...pub } = app;
-      return json(200, pub);
+      return json(200, pubApp(app));
+    }
+    if ((m = path.match(/^\/deviceAppManagement\/mobileApps\/([^/]+)\/relationships$/)) && method === 'GET') {
+      const app = apps.get(m[1]);
+      return app ? json(200, { value: relationshipsOf(app) }) : err(404, 'ResourceNotFound', 'App not found');
+    }
+    if ((m = path.match(/^\/deviceAppManagement\/mobileApps\/([^/]+)\/updateRelationships$/)) && method === 'POST') {
+      const app = apps.get(m[1]);
+      if (!app) return err(404, 'ResourceNotFound', 'App not found');
+      const next = [];
+      for (const r of (body && body.relationships) || []) {
+        if (!apps.has(r.targetId)) return err(400, 'BadRequest', `Target app ${r.targetId} not found`);
+        const kind = /Dependency$/.test(r['@odata.type']) ? 'dependency' : 'supersedence';
+        next.push(kind === 'dependency' ? { kind, targetId: r.targetId, dependencyType: r.dependencyType || 'autoInstall' } : { kind, targetId: r.targetId, supersedenceType: r.supersedenceType || 'update' });
+      }
+      app._rels = next;
+      return json(204, null);
     }
     if ((m = path.match(/^\/deviceAppManagement\/mobileApps\/([^/]+)$/)) && method === 'DELETE') {
       const app = apps.get(m[1]);
       if (!app) return err(404, 'ResourceNotFound', 'App not found');
-      if (app.dependentAppCount || app.supersedingAppCount || app.supersededAppCount) {
+      if (app._rels.length || inbound(app).length) {
         return err(400, 'BadRequest', 'This app has dependency or supersedence relationships. Remove them before deleting the app.');
       }
       apps.delete(m[1]);
       return json(204, null);
     }
-    if ((m = path.match(/^\/groups\/([^/]+)\/members$/)) && method === 'GET') {
+    if ((m = path.match(/^\/groups\/([^/]+)\/(members|transitiveMembers)(?:\/microsoft\.graph\.(user|device|group))?$/)) && method === 'GET') {
       const g = groups.get(m[1]);
       if (!g) return err(404, 'Request_ResourceNotFound', 'Group not found');
-      return json(200, { '@odata.count': g._members, value: [] });
+      let list = m[2] === 'members' ? membersOf(g) : transitive(g);
+      if (m[3]) list = list.filter(o => o['@odata.type'] === `#microsoft.graph.${m[3]}`);
+      return json(200, pageOf(list, q, rawUrl));
+    }
+    if (path === '/groups' && method === 'GET') {
+      let list = [...groups.values()];
+      const f = q.get('$filter') || '';
+      const search = q.get('$search');
+      let fm;
+      if ((fm = f.match(/^startswith\(displayName,\s*'((?:[^']|'')*)'\)$/i))) { const v = fm[1].replace(/''/g, "'").toLowerCase(); list = list.filter(g => g.displayName.toLowerCase().startsWith(v)); }
+      else if ((fm = f.match(/^displayName eq '((?:[^']|'')*)'$/i))) { const v = fm[1].replace(/''/g, "'").toLowerCase(); list = list.filter(g => g.displayName.toLowerCase() === v); }
+      else if (f) return err(400, 'BadRequest', 'Unsupported filter');
+      if (search) { const v = search.replace(/^"|"$/g, '').replace(/^displayName:/i, '').toLowerCase(); list = list.filter(g => g.displayName.toLowerCase().includes(v)); }
+      return json(200, pageOf(list.map(pubGroup), q, rawUrl));
     }
     if ((m = path.match(/^\/groups\/([^/]+)$/))) {
       const g = groups.get(m[1]);
       if (!g) return err(404, 'Request_ResourceNotFound', `Resource '${m[1]}' does not exist.`);
-      if (method === 'GET') { const { _members, ...pub } = g; return json(200, pub); }
+      if (method === 'GET') return json(200, pubGroup(g));
       if (method === 'DELETE') {
         if (g.onPremisesSyncEnabled) return err(400, 'Request_BadRequest', 'Unable to update the specified properties for on-premises mastered Directory Sync objects.');
         groups.delete(m[1]);

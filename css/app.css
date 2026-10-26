@@ -246,3 +246,40 @@ body[data-mode="live"] .progress > i { background: var(--live); }
   .assign-list div { grid-template-columns: 1fr; gap: 0; padding-bottom: 6px; }
   main { padding: 12px 12px 140px; }
 }
+
+/* relationships in the delete dialog */
+.rel-box { display: grid; gap: 8px; }
+.radio-col { display: grid; gap: 4px; margin-top: 4px; }
+.rel-groups { display: grid; gap: 6px; }
+.rel-groups details { background: var(--surface); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; }
+.rel-groups details.risk { border-color: var(--danger); }
+.rel-groups details.risk summary { color: var(--danger); }
+.rel-groups summary { cursor: pointer; font-weight: 600; font-size: 13px; }
+.rel-groups .list-compact { max-height: 180px; }
+.risk-opt { color: var(--danger); font-weight: 600; }
+
+/* analytics */
+.a-sources { display: grid; grid-template-columns: 1fr 1.4fr; gap: 24px; }
+.a-sources h3 { margin: 0 0 4px; font-size: 14px; }
+.a-sources > div, .a-gsearch { display: grid; gap: 8px; align-content: start; justify-items: start; }
+.a-gsearch textarea { min-height: 54px; }
+.a-toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 4px 0 8px; }
+.a-toolbar input[type=search] { width: 260px; }
+.a-filters { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; margin-bottom: 4px; }
+.seg { display: inline-flex; border: 1px solid var(--line-strong); border-radius: 8px; overflow: hidden; }
+.seg button { border: 0; background: var(--surface); color: var(--muted); font: 600 13px var(--sans); padding: 6px 12px; cursor: pointer; }
+.seg button + button { border-left: 1px solid var(--line-strong); }
+.seg button.on { background: var(--accent-soft); color: var(--text); }
+.a-table td { vertical-align: top; }
+.a-table tr.app-row td { background: var(--surface-2); border-top: 2px solid var(--line-strong); }
+.a-table .refs { display: grid; gap: 3px; }
+.ref { display: flex; gap: 6px; align-items: center; font-size: 13px; flex-wrap: wrap; }
+.ref.analysed span:last-child { font-weight: 600; }
+.linkish { border: 0; background: none; padding: 0; font: 600 13.5px var(--sans); color: var(--accent); cursor: pointer; text-align: left; }
+.linkish:hover { text-decoration: underline; }
+.crumbs { font-size: 13px; color: var(--muted); }
+dialog.wide { width: min(1100px, calc(100% - 24px)); }
+.members-table { max-height: 50vh; }
+@media (max-width: 900px) { .a-sources { grid-template-columns: 1fr; } }
+.rel-msg { margin: 0; }
+label.plain { display: block; font-weight: 400; }

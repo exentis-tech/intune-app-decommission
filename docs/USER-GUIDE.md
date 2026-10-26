@@ -10,7 +10,8 @@ The screenshots use a fictitious *Contoso* tenant.
 - [5. Delete apps](#5-delete-apps)
 - [6. Groups ledger](#6-groups-ledger)
 - [7. Delete groups](#7-delete-groups)
-- [8. Activity log and audit log](#8-activity-log-and-audit-log)
+- [8. Analytics](#8-analytics)
+- [9. Activity log and audit log](#9-activity-log-and-audit-log)
 - [Typical decommissioning run](#typical-decommissioning-run)
 
 ## The header: Dry run and Live
@@ -100,7 +101,24 @@ The preview shows how many assignments on how many apps will go, and how many gr
 
 ![Delete apps dry run](screenshots/07-delete-apps-dry-run.png)
 
-Apps with dependency or supersedence relationships are listed and skipped by default.
+### Supersedence and dependencies
+
+Intune won't delete an app while it has a supersedence or dependency link. The dialog reads every link of the selected apps and explains what happens to each:
+
+![Delete with links](screenshots/18-delete-with-links.png)
+
+| Group in the dialog | Example | What the tool does |
+|---|---|---|
+| **Between apps you are deleting** | AnyDesk 7.9.1 supersedes 7.6.2, both selected | Removed. |
+| **Kept apps that supersede an app you are deleting** | AnyDesk 8.1.0 (kept) supersedes 8.0.4 (deleted) | The link is removed from 8.1.0. Safe: devices keep what they have; 8.1.0 just stops referencing an app that won't exist. |
+| **Kept apps that DEPEND on an app you are deleting** | Contoso ERP Client (kept) depends on Java 8u202 | **Risky.** By default the prerequisite app is skipped. Tick *Also remove dependencies from kept apps* only if the kept app no longer needs it (or replace the dependency in Intune first). |
+| **Apps you are deleting that supersede or depend on kept apps** | an old package that depended on a runtime you keep | Removed together with the app; the kept app isn't changed. |
+
+Choose **Remove the links first, then delete** (default) or **Skip these apps, delete the rest**. The run removes links first, then deletes; if removing a link fails, the apps that needed it are skipped rather than failing half-way.
+
+![Unlink run](screenshots/19-unlink-run.png)
+
+The JSON backup contains `relationshipChanges` with every app's links *before* and *after*, so a link can be recreated with `POST /deviceAppManagement/mobileApps/{ownerId}/updateRelationships` and the `before` list.
 
 In Live mode you type `DELETE` to confirm, and can download a JSON backup of the apps and their assignments (with group names) first.
 
@@ -147,7 +165,29 @@ Microsoft 365 and role-assignable groups get an extra warning. Afterwards the le
 
 ![Ledger after cleanup](screenshots/15-ledger-after-cleanup.png)
 
-## 8. Activity log and audit log
+## 8. Analytics
+
+Read-only forensics to understand apps and groups before (or instead of) changing anything.
+
+**Analyse apps** uses the apps shown on *1 · Find apps*.
+
+- **By app** — one block per app, one row per assignment: intent (*Required / Available / Uninstall*), target (*Include / Exclude / All users / All devices*), group with its type, direct **users**, **devices**, **nested groups**, **all users including nested**, and the assignment filter.
+
+  ![Analytics by app](screenshots/20-analytics-by-app.png)
+
+- **By group** — every group behind those apps and what it is assigned to. *Also find every other app and policy using these groups* scans the whole tenant (apps, configuration profiles, settings catalog, compliance, ADMX, scripts, remediations, app configuration).
+
+  ![Analytics by group](screenshots/21-analytics-by-group.png)
+
+**Find groups** searches by name: `SG-APP-7Zip` (starts with), `SG-APP-*` (wildcard), `*AnyDesk*` (contains) or an object ID, one per line — then shows everything those groups are assigned to.
+
+Filter by intent and target type, filter by text, and **Export CSV** the current view.
+
+**Click any group** to open its members: nested groups, users and devices, plus **All users incl. nested**. *Open ›* drills into a nested group (the breadcrumb takes you back). Copy UPNs, names or object IDs, or export the list to CSV.
+
+![Group members](screenshots/22-group-members.png)
+
+## 9. Activity log and audit log
 
 **Activity log** lists every write in the browser session — mode (DRY / LIVE), action, target, the exact Graph call and the result — and exports to CSV.
 

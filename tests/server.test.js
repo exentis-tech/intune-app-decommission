@@ -127,6 +127,32 @@ test('only the three allowed deletes exist, and no other verbs', async () => {
   assert.equal((await g(LIVE, t, '/deviceAppManagement/mobileApps', { method: 'POST', body: '{}' })).status, 405);
 });
 
+test('updateRelationships may only remove existing links', async () => {
+  const list = await (await g(LIVE, live.sessionToken, '/deviceAppManagement/mobileApps')).json();
+  const all = list.value;
+  const newer = all.find(a => a.displayName === 'AnyDesk_User' && a.displayVersion === '8.1.0');
+  const other = all.find(a => a.displayName === '7-Zip 23.01');
+  const rels = await (await g(LIVE, live.sessionToken, `/deviceAppManagement/mobileApps/${newer.id}/relationships`)).json();
+  const child = rels.value.find(r => r.targetType === 'child');
+  const post = (port, token, body) => g(port, token, `/deviceAppManagement/mobileApps/${newer.id}/updateRelationships`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  // adding a link is refused
+  const add = await post(LIVE, live.sessionToken, { relationships: [
+    { '@odata.type': child['@odata.type'], targetId: child.targetId, supersedenceType: child.supersedenceType },
+    { '@odata.type': '#microsoft.graph.mobileAppSupersedence', targetId: other.id, supersedenceType: 'update' },
+  ] });
+  assert.equal(add.status, 403);
+  assert.equal((await add.json()).error.code, 'OnlyRemovalAllowed');
+  // refused entirely while EnableRealDelete is false
+  assert.equal((await post(DRY, dry.sessionToken, { relationships: [] })).status, 403);
+  // removing is allowed
+  assert.equal((await post(LIVE, live.sessionToken, { relationships: [] })).status, 204);
+  const after = await (await g(LIVE, live.sessionToken, `/deviceAppManagement/mobileApps/${newer.id}/relationships`)).json();
+  assert.equal(after.value.filter(r => r.targetType === 'child').length, 0);
+  // other POSTs are still refused
+  assert.equal((await g(LIVE, live.sessionToken, `/deviceAppManagement/mobileApps/${newer.id}/assign`, { method: 'POST', body: '{}' })).status, 405);
+});
+
 test('live deletes reach Graph and are audited', async () => {
   const t = live.sessionToken;
   const list = await (await g(LIVE, t, '/deviceAppManagement/mobileApps')).json();

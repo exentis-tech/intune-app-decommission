@@ -30,8 +30,9 @@ These hold even if someone edits the UI or calls the local API directly.
 | Session token | A random 256-bit token is created at each start. Every `/graph/*` call must send it in `X-IAD-Session`. Other websites can't read it (same-origin policy, no CORS). |
 | Read allowlist | `GET` only under `/deviceAppManagement`, `/deviceManagement`, `/groups`, `/organization`. Users, mail, files, etc. are refused. |
 | `$batch` | Allowed only when every sub-request is a `GET` inside the read allowlist. |
-| Write allowlist | Exactly three operations: `DELETE /deviceAppManagement/mobileApps/{id}`, `DELETE /deviceAppManagement/mobileApps/{id}/assignments/{id}`, `DELETE /groups/{id}`. `POST`, `PATCH`, `PUT` and every other `DELETE` are refused. |
-| Master switch | `EnableRealDelete: false` refuses all deletes. |
+| Write allowlist | Exactly four operations: `DELETE /deviceAppManagement/mobileApps/{id}`, `DELETE /deviceAppManagement/mobileApps/{id}/assignments/{id}`, `DELETE /groups/{id}`, and `POST /deviceAppManagement/mobileApps/{id}/updateRelationships`. Every other `POST`, and all `PATCH` and `PUT`, are refused. |
+| Remove-only relationships | Before forwarding `updateRelationships`, the server reads the app's current relationships and refuses the call (`OnlyRemovalAllowed`) if the new list contains any link that doesn't already exist. The tool can drop supersedence / dependency links but never create or change one. The request body is written to the audit log. |
+| Master switch | `EnableRealDelete: false` refuses every write: deletes and relationship changes. |
 | Audit log | Every delete attempt — success, failure or blocked — is appended to `logs/audit-<date>.jsonl`. |
 | Static files | Only `index.html`, `css/*.css`, `js/*.js` and `docs/*.png|svg` are served; `config.json`, scripts and logs never are. Paths are resolved and checked against the tool folder. |
 | Response headers | `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store`. |
